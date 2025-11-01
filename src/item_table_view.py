@@ -1,35 +1,39 @@
+# -*- coding: latin-1 -*-
 import tkinter as tk
 from tkinter import ttk
 from pathlib import Path
 from typing import List, Dict, Optional
 
 
-def show_item_table(parent, title: str, headers: List[str], records: List[Dict[str, str]], encoding: str = 'utf-8', file_path: Optional[Path] = None):
-    """Abre uma janela Toplevel mostrando os registros em uma Treeview com colunas horizontais.
+def show_item_table(parent, title: str, headers: List[str], records: List[Dict[str, str]], encoding: str = 'utf-8', file_path: Optional[Path] = None, embed: bool = False):
+    """Mostra os registros em uma Treeview.
 
-    headers: lista de nomes de colunas
-    records: lista de dicts header->valor
+    Se embed==False (padrão), abre em Toplevel; se embed==True, usa o widget fornecido em `parent`
+    como container (por exemplo um Frame dentro da janela principal).
     """
-    win = tk.Toplevel(parent)
-    win.title(f"{title} — encoding: {encoding}")
-    win.geometry('1200x600')
-
-    frm = ttk.Frame(win)
-    frm.pack(fill='both', expand=True)
+    if embed:
+        container = parent
+    else:
+        win = tk.Toplevel(parent)
+        win.title(f"{title} — encoding: {encoding}")
+        win.geometry('1200x600')
+        container = ttk.Frame(win)
+        container.pack(fill='both', expand=True)
 
     # container para Treeview + scrollbars
-    tv_frame = ttk.Frame(frm)
-    tv_frame.pack(fill='both', expand=True)
+    tv_frame = ttk.Frame(container)
+    # centralizar visualização com padding
+    tv_frame.pack(fill='both', expand=True, padx=12, pady=8)
 
     cols = headers
     tree = ttk.Treeview(tv_frame, columns=cols, show='headings')
 
     # configura colunas
     for c in cols:
-        # largura proporcional, Name normalmente maior
-        width = 120 if c.lower() != 'name' and c.lower() != 'tip' else 300
-        tree.heading(c, text=c)
-        tree.column(c, width=width, anchor='w')
+        # largura proporcional, Name/Tip normalmente maior
+        width = 120 if c.lower() not in ('name', 'tip') else 300
+        tree.heading(c, text=c, anchor='center')
+        tree.column(c, width=width, anchor='center')
 
     # scrollbars
     vbar = ttk.Scrollbar(tv_frame, orient='vertical', command=tree.yview)
@@ -44,13 +48,75 @@ def show_item_table(parent, title: str, headers: List[str], records: List[Dict[s
     tv_frame.columnconfigure(0, weight=1)
 
     # inserir registros (cuidado com muitos registros)
-    for i, rec in enumerate(records):
-        # ordem dos valores de acordo com headers
-        vals = [rec.get(h, '') for h in headers]
-        tree.insert('', 'end', values=vals)
+    # inserir registros em lotes para evitar travamento em arquivos grandes
+    tree.tag_configure('odd', background='#ffffff')
+    tree.tag_configure('even', background='#f7f7f7')
+
+    # Frame de controle com progresso e botão de cancelar
+    ctrl_frame = ttk.Frame(container)
+    ctrl_frame.pack(fill='x', pady=(4, 8))
+    progress_lbl = ttk.Label(ctrl_frame, text=f'Carregando 0 / {len(records)}')
+    progress_lbl.pack(side='left')
+    stop_btn = ttk.Button(ctrl_frame, text='Cancelar carregamento')
+    stop_btn.pack(side='right')
+
+    cancelled = {'v': False}
+    def do_cancel():
+        cancelled['v'] = True
+        stop_btn.config(state='disabled')
+
+    stop_btn.config(command=do_cancel)
+
+    batch_size = 500  # número de linhas inseridas por lote (ajustável)
+
+    children_cache = []
+
+    def insert_batch(start=0):
+        # se o container ou tree foram destruídos, aborta limpeza
+        try:
+            if cancelled['v']:
+                progress_lbl.config(text=f'Carregamento cancelado em {start} / {len(records)}')
+                return
+        except Exception:
+            return
+        if not tree.winfo_exists():
+            # widget já destruído, cancelar carregamento
+            cancelled['v'] = True
+            return
+        end = min(start + batch_size, len(records))
+        try:
+            for i in range(start, end):
+                rec = records[i]
+                vals = [rec.get(h, '') for h in headers]
+                tag = 'even' if (i % 2 == 0) else 'odd'
+                tree.insert('', 'end', values=vals, tags=(tag,))
+        except tk.TclError:
+            # widget foi destruído durante a inserção (usuário fechou janela) -> cancelar
+            cancelled['v'] = True
+            try:
+                progress_lbl.config(text=f'Carregamento cancelado (widget destruído) {start} / {len(records)}')
+            except Exception:
+                pass
+            return
+        progress_lbl.config(text=f'Carregando {end} / {len(records)}')
+        # schedule next batch
+        if end < len(records):
+            container.after(10, insert_batch, end)
+        else:
+            progress_lbl.config(text=f'Carregado {len(records)} registros')
+            stop_btn.config(state='disabled')
+
+    # iniciar inserção assíncrona — não bloqueia a UI
+    # marcar cancelado se o container for destruído (fecha janela enquanto carrega)
+    def _on_destroy(event):
+        cancelled['v'] = True
+
+    container.bind('<Destroy>', _on_destroy)
+
+    container.after(20, insert_batch, 0)
 
     # simples função para mostrar detalhe quando selecionar
-    detail = tk.Text(frm, height=6, wrap='word')
+    detail = tk.Text(container, height=6, wrap='word')
     detail.pack(fill='x')
 
     def on_select(event=None):
@@ -86,7 +152,8 @@ def show_item_table(parent, title: str, headers: List[str], records: List[Dict[s
         current_val = records[item_index].get(header, '')
 
         # editor multi-line
-        dlg = tk.Toplevel(win)
+        root_toplevel = win if not embed else parent.winfo_toplevel()
+        dlg = tk.Toplevel(root_toplevel)
         dlg.title(f'Editar: {header}')
         dlg.geometry('600x400')
         txt = tk.Text(dlg, wrap='word')
@@ -112,7 +179,7 @@ def show_item_table(parent, title: str, headers: List[str], records: List[Dict[s
     tree.bind('<Double-1>', on_double_click)
 
     # botão para exportar como CSV
-    btn_frame = ttk.Frame(frm)
+    btn_frame = ttk.Frame(container)
     btn_frame.pack(fill='x')
     def export_csv():
         fpath = Path.cwd() / f"{title}.export.csv"
@@ -158,4 +225,6 @@ def show_item_table(parent, title: str, headers: List[str], records: List[Dict[s
     if file_path:
         ttk.Button(btn_frame, text='Salvar no arquivo', command=save_back).pack(side='left', padx=6)
 
+    if embed:
+        return container
     return win

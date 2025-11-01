@@ -1,22 +1,22 @@
 # -*- coding: latin-1 -*-
 """
-Editor simples de arquivos INI
-- Lista arquivos .ini e .txt (opcional) dentro de `Assets/` (recursivo)
-- Mostra seções e chaves
-- Permite adicionar/editar/remover chaves e seções
-- Salva alterações no arquivo selecionado
+INI Editor - GUI principal reescrito
+- Lista arquivos em Assets/
+- Detecta arquivos pipe-delimited (items) usando src.parser
+- Abre visualização tabular para arquivos de items (src.item_table_view)
+- Para INI tradicionais, mostra seções/chaves/valor e permite editar/salvar usando a codificação detectada
 
 Uso: python ini_editor.py
 """
 
+from pathlib import Path
 import os
-import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import configparser
-from pathlib import Path
+from typing import Optional
 
-# módulos do pacote src
+# tenta importar módulos do pacote src
 try:
     from src import parser as data_parser
     from src import item_table_view
@@ -24,272 +24,322 @@ except Exception:
     data_parser = None
     item_table_view = None
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ASSETS_DIR = os.path.join(SCRIPT_DIR, 'Assets')
+PREFERRED_ENCODINGS = ['utf-8', 'big5', 'cp1252', 'latin-1']
 
-# Encodings tentadas ao abrir arquivos INI (ordem importa: mais prováveis primeiro)
-PREFERRED_ENCODINGS = [
-    'utf-8',
-    'utf-8-sig',
-    'utf-16',
-    'utf-16le',
-    'utf-16be',
-    'big5',
-    'cp1252',  # Windows ANSI / Western European
-    'latin-1',
-]
+SCRIPT_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = SCRIPT_DIR / 'Assets'
+HEADERS_DIR = ASSETS_DIR / 'Headers'
+H_ITEM = HEADERS_DIR / 'h_item'
 
-class IniEditor(tk.Tk):
+
+def read_text_with_encodings(path: Path, encodings=None):
+    """Tenta ler o arquivo com várias encodings até encontrar que funcione.
+    Retorna (text, encoding)
+    """
+    # se não informado, usar encodings preferidas
+    if encodings is None:
+        encodings = PREFERRED_ENCODINGS
+
+    # Leitura de bytes e heurística de seleção de encoding baseada em contagem de
+    # caracteres CJK e número de caracteres de substituição (). Isso evita escolher
+    # latin-1/cp1252 quando o conteúdo for Big5 (chines tradicional).
+    raw = path.read_bytes()
+    best = None
+    best_score = None
+    import re
+    cjk_re = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]')
+    for enc in encodings:
+        try:
+            txt = raw.decode(enc, errors='replace')
+        except Exception:
+            continue
+        repl = txt.count('\ufffd') + txt.count('')
+        cjk = len(cjk_re.findall(txt))
+        # score: prefer many CJK chars and penalize replacements
+        score = cjk * 10 - repl * 100
+        if best_score is None or score > best_score:
+            best_score = score
+            best = (txt, enc)
+
+    if best is not None:
+        return best
+    # fallback permissivo
+    return raw.decode('latin-1', errors='replace'), 'latin-1'
+
+
+class IniEditorApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('INI Editor')
-        self.geometry('900x600')
+        self.geometry('1100x700')
 
-        self.config_file = None
-        # Guarda a codificação detectada do arquivo aberto (para salvar com mesma codificação)
-        self.file_encoding = None
-        # configparser permissivo para valores sem = (opcional)
+        self.assets_dir = ASSETS_DIR
+        self.current_file: Optional[Path] = None
+        self.current_encoding: Optional[str] = None
         self.cfg = configparser.ConfigParser(allow_no_value=True)
 
         self.create_widgets()
-        self.load_assets_directory()
+        self.refresh_file_list()
 
     def create_widgets(self):
-        # Left: arquivos
-        left = ttk.Frame(self)
+        # Layout: left = file list, right = viewer (sections + table + value editor)
+        main = ttk.Frame(self)
+        main.pack(fill='both', expand=True)
+
+        left = ttk.Frame(main, width=320)
         left.pack(side='left', fill='y')
 
-        ttk.Label(left, text='Arquivos (Assets)').pack(anchor='w', padx=6, pady=(6,0))
-        self.file_list = tk.Listbox(left, width=40)
-        self.file_list.pack(fill='y', expand=True, padx=6, pady=6)
-        self.file_list.bind('<<ListboxSelect>>', self.on_file_select)
+        ttk.Label(left, text='Arquivos (Assets)').pack(anchor='w', padx=8, pady=(8,0))
+        self.file_listbox = tk.Listbox(left, width=48)
+        self.file_listbox.pack(fill='y', expand=True, padx=8, pady=8)
+        self.file_listbox.bind('<<ListboxSelect>>', self.on_file_select)
 
-        btn_frame = ttk.Frame(left)
-        btn_frame.pack(fill='x', padx=6, pady=6)
-        ttk.Button(btn_frame, text='Recarregar', command=self.load_assets_directory).pack(side='left')
-        ttk.Button(btn_frame, text='Abrir Pasta...', command=self.choose_folder).pack(side='left', padx=6)
+        btns = ttk.Frame(left)
+        btns.pack(fill='x', padx=8, pady=8)
+        ttk.Button(btns, text='Recarregar', command=self.refresh_file_list).pack(side='left')
+        ttk.Button(btns, text='Abrir pasta...', command=self.choose_folder).pack(side='left', padx=6)
 
-        # Right: secões/chaves/valor
-        right = ttk.Frame(self)
+        # right area
+        right = ttk.Frame(main)
         right.pack(side='right', fill='both', expand=True)
 
-        top_right = ttk.Frame(right)
-        top_right.pack(fill='both', expand=True, padx=6, pady=6)
+        # área principal de visualização: centralizada e única (remoção do painel de seções/chaves)
+        self.viewer_frame = ttk.Frame(right)
+        self.viewer_frame.pack(fill='both', expand=True, padx=8, pady=8)
 
-        # Sections
-        s_frame = ttk.Frame(top_right)
-        s_frame.pack(side='left', fill='y')
-        ttk.Label(s_frame, text='Seções').pack(anchor='w')
-        self.section_list = tk.Listbox(s_frame, width=28)
-        self.section_list.pack(fill='y', expand=True)
-        self.section_list.bind('<<ListboxSelect>>', self.on_section_select)
+        # placeholder: uma Label discreta até um arquivo ser aberto
+        self.viewer_placeholder = ttk.Label(self.viewer_frame, text='Abra um arquivo à esquerda para visualizar (tabela/RAW)')
+        self.viewer_placeholder.pack(expand=True)
 
-        s_btns = ttk.Frame(s_frame)
-        s_btns.pack(fill='x', pady=6)
-        ttk.Button(s_btns, text='Nova Seção', command=self.add_section).pack(side='left')
-        ttk.Button(s_btns, text='Remover Seção', command=self.remove_section).pack(side='left', padx=6)
+    def ensure_ini_widgets(self):
+        """Cria os widgets necessários para editar INI (seções, chaves, editor) dentro de
+        `self.viewer_frame` caso ainda não existam. Usado apenas quando abrimos um arquivo
+        INI tradicional."""
+        if hasattr(self, 'sections_lb') and hasattr(self, 'keys_tree') and hasattr(self, 'value_text'):
+            return
+        # limpar o conteúdo atual do viewer
+        for c in list(self.viewer_frame.winfo_children()):
+            c.destroy()
 
-        # Keys (tabela tipo CSV: coluna Chave | Valor)
-        k_frame = ttk.Frame(top_right)
-        k_frame.pack(side='left', fill='y', padx=(8,0))
-        ttk.Label(k_frame, text='Chaves (tabela)').pack(anchor='w')
+        top = ttk.Frame(self.viewer_frame)
+        top.pack(fill='both', expand=True, padx=8, pady=8)
 
-        # Treeview com duas colunas: Chave e Valor (preview)
-        cols = ('chave', 'valor')
-        self.key_tree = ttk.Treeview(k_frame, columns=cols, show='headings', selectmode='browse', height=20)
-        self.key_tree.heading('chave', text='Chave')
-        self.key_tree.heading('valor', text='Valor (preview)')
-        self.key_tree.column('chave', width=180, anchor='w')
-        self.key_tree.column('valor', width=320, anchor='w')
-        self.key_tree.pack(fill='y', expand=True)
-        self.key_tree.bind('<<TreeviewSelect>>', self.on_key_select)
+        # sections list
+        sframe = ttk.Frame(top)
+        sframe.pack(side='left', fill='y')
+        ttk.Label(sframe, text='Seções').pack(anchor='w')
+        self.sections_lb = tk.Listbox(sframe, width=30)
+        self.sections_lb.pack(fill='y', expand=True)
+        self.sections_lb.bind('<<ListboxSelect>>', self.on_section_select)
+        sbtns = ttk.Frame(sframe)
+        sbtns.pack(fill='x', pady=6)
+        ttk.Button(sbtns, text='Nova Seção', command=self.add_section).pack(side='left')
+        ttk.Button(sbtns, text='Remover Seção', command=self.remove_section).pack(side='left', padx=6)
 
-        k_btns = ttk.Frame(k_frame)
-        k_btns.pack(fill='x', pady=6)
-        ttk.Button(k_btns, text='Nova Chave', command=self.add_key).pack(side='left')
-        ttk.Button(k_btns, text='Remover Chave', command=self.remove_key).pack(side='left', padx=6)
+        # keys table
+        kframe = ttk.Frame(top)
+        kframe.pack(side='left', fill='both', expand=True, padx=(8,0))
+        ttk.Label(kframe, text='Chaves (tabela)').pack(anchor='w')
+        self.keys_tree = ttk.Treeview(kframe, columns=('key', 'value'), show='headings')
+        self.keys_tree.heading('key', text='Chave')
+        self.keys_tree.heading('value', text='Valor (preview)')
+        self.keys_tree.column('key', width=220, anchor='w')
+        self.keys_tree.column('value', width=420, anchor='w')
+        self.keys_tree.pack(fill='both', expand=True)
+        self.keys_tree.bind('<<TreeviewSelect>>', self.on_key_select)
+        self.keys_tree.bind('<Double-1>', self.on_key_double_click)
 
-        # Value editor
-        v_frame = ttk.Frame(top_right)
-        v_frame.pack(side='left', fill='both', expand=True, padx=(8,0))
-        ttk.Label(v_frame, text='Valor').pack(anchor='w')
-        self.value_text = tk.Text(v_frame, wrap='none')
+        kbtns = ttk.Frame(kframe)
+        kbtns.pack(fill='x', pady=6)
+        ttk.Button(kbtns, text='Nova Chave', command=self.add_key).pack(side='left')
+        ttk.Button(kbtns, text='Remover Chave', command=self.remove_key).pack(side='left', padx=6)
+
+        # value editor
+        vframe = ttk.Frame(top)
+        vframe.pack(side='left', fill='both', expand=True, padx=(8,0))
+        ttk.Label(vframe, text='Valor').pack(anchor='w')
+        self.value_text = tk.Text(vframe, wrap='none')
         self.value_text.pack(fill='both', expand=True)
 
-        save_frame = ttk.Frame(v_frame)
-        save_frame.pack(fill='x', pady=6)
-        ttk.Button(save_frame, text='Salvar', command=self.save_file).pack(side='left')
-        ttk.Button(save_frame, text='Recarregar Arquivo', command=self.reload_current_file).pack(side='left', padx=6)
+        vbtns = ttk.Frame(vframe)
+        vbtns.pack(fill='x', pady=6)
+        ttk.Button(vbtns, text='Salvar', command=self.save_current).pack(side='left')
+        ttk.Button(vbtns, text='Recarregar', command=self.reload_current).pack(side='left', padx=6)
 
-    def load_assets_directory(self):
-        self.file_list.delete(0, 'end')
-        if not os.path.isdir(ASSETS_DIR):
-            messagebox.showwarning('Assets não encontrado', f"Pasta {ASSETS_DIR} não existe. Escolha a pasta Assets.")
-            self.choose_folder()
+    def refresh_file_list(self):
+        self.file_listbox.delete(0, 'end')
+        if not self.assets_dir.exists():
+            messagebox.showwarning('Assets não encontrado', f'Pasta {self.assets_dir} não existe.')
             return
-
         files = []
-        for root, dirs, filenames in os.walk(ASSETS_DIR):
+        for root, dirs, filenames in os.walk(self.assets_dir):
             for f in filenames:
                 if f.lower().endswith('.ini') or f.lower().endswith('.txt'):
-                    files.append(os.path.join(root, f))
+                    full = Path(root) / f
+                    try:
+                        rel = full.relative_to(SCRIPT_DIR)
+                    except Exception:
+                        rel = full
+                    files.append(rel)
         files.sort()
         for p in files:
-            self.file_list.insert('end', os.path.relpath(p, SCRIPT_DIR))
+            self.file_listbox.insert('end', str(p))
 
     def choose_folder(self):
-        folder = filedialog.askdirectory(initialdir=SCRIPT_DIR, title='Escolha a pasta Assets')
+        folder = filedialog.askdirectory(initialdir=str(SCRIPT_DIR), title='Escolha a pasta Assets')
         if not folder:
             return
-        global ASSETS_DIR
-        ASSETS_DIR = folder
-        self.load_assets_directory()
+        self.assets_dir = Path(folder)
+        self.refresh_file_list()
 
     def on_file_select(self, event=None):
-        sel = self.file_list.curselection()
+        sel = self.file_listbox.curselection()
         if not sel:
             return
-        rel = self.file_list.get(sel[0])
-        path = os.path.join(SCRIPT_DIR, rel)
+        rel = self.file_listbox.get(sel[0])
+        path = Path(rel)
+        if not path.is_absolute():
+            path = SCRIPT_DIR / rel
         self.open_file(path)
 
-    def open_file(self, path):
-        self.config_file = path
-        self.file_encoding = None
-        self._wrapped_root = False
+    def open_file(self, path: Path):
+        self.current_file = path
+        try:
+            text, enc = read_text_with_encodings(path)
+            self.current_encoding = enc
+        except Exception as e:
+            messagebox.showerror('Erro ao abrir', f'Erro ao ler {path}: {e}')
+            return
 
-        # tenta várias codificações até encontrar uma que permita leitura
-        last_exception = None
-        for enc in PREFERRED_ENCODINGS:
+        # primeiro tente detectar arquivos pipe-delimited (items) usando headers h_item
+        try:
+            if data_parser and H_ITEM.exists():
+                headers = data_parser.load_headers(H_ITEM)
+                # usar heurística mais robusta (não confiar no tamanho do dict,
+                # pois headers podem ter nomes duplicados que colapsam chaves)
+                if data_parser.is_pipe_file(text, headers):
+                    records = data_parser.parse_pipe_text(text, headers)
+                    if item_table_view:
+                        # limpar placeholder
+                        for c in list(self.viewer_frame.winfo_children()):
+                            c.destroy()
+                        # embedar a tabela no painel central
+                        item_table_view.show_item_table(self.viewer_frame, path.name, headers, records, encoding=enc, file_path=path, embed=True)
+                        self.title(f'INI Editor — {path.name} (encoding: {enc})')
+                        return
+        except Exception:
+            # se falhar, continuar para tentar INI
+            pass
+
+        # tentar abrir como INI com configparser
+        self.cfg = configparser.ConfigParser(allow_no_value=True)
+        try:
+            # prefer read_string (usamos o texto já lido)
+            self.cfg.read_string(text)
+        except configparser.MissingSectionHeaderError:
+            # arquivo não tem seções — informar e mostrar raw
+            messagebox.showinfo('Formato', f'O arquivo {path} não contém sections; abrindo visualizador bruto.')
+            self.show_raw_text(text)
+            return
+        except Exception as e:
+            # tentar ler via cfg.read
             try:
-                with open(path, 'r', encoding=enc) as fh:
-                    text = fh.read()
-
-                # Detectar se é um arquivo pipe-delimited (items) comparando com header se disponível
-                try:
-                    headers_path = Path(SCRIPT_DIR) / 'Assets' / 'Headers' / 'h_item'
-                    if headers_path.exists() and data_parser:
-                        headers = data_parser.load_headers(headers_path)
-                        # primeira tentativa rápida de detecção por amostra
-                        sample = text[:16000]
-                        expected_separators = max(0, len(headers) - 1)
-                        is_pipe_sample = data_parser.detect_pipe_file_sample(sample, expected_separators)
-
-                        # tenta parsear do texto lido para ser mais robusto (registros multilinha)
-                        records = data_parser.parse_pipe_text(text, headers)
-                        # heurística: considerar pipe-file se obtivemos pelo menos 1 registro
-                        # e o primeiro registro tem a quantidade de campos esperada
-                        if records and isinstance(records, list) and len(records[0]) == len(headers):
-                            # abrir visualizador com encoding detectado nesta tentativa
-                            self.file_encoding = enc
-                            if item_table_view:
-                                item_table_view.show_item_table(self, os.path.basename(path), headers, records, encoding=enc, file_path=Path(path))
-                                return
-                        # se não detectado e detect_pipe_file_sample indicar True, tentar parse via arquivo
-                        if not records and is_pipe_sample:
-                            records, used_enc = data_parser.parse_pipe_file(Path(path), headers)
-                            if records:
-                                self.file_encoding = used_enc
-                                if item_table_view:
-                                    item_table_view.show_item_table(self, os.path.basename(path), headers, records, encoding=used_enc, file_path=Path(path))
-                                    return
-                except Exception:
-                    # se algo falhar no parser especializado, continuar para tentar configparser
-                    pass
-
-                # tenta interpretar com configparser
-                cfg = configparser.ConfigParser(allow_no_value=True)
-                try:
-                    cfg.read_string(text)
-                    self.cfg = cfg
-                    self.file_encoding = enc
-                    break
-                except configparser.MissingSectionHeaderError:
-                    # alguns INI não têm seção; tente ler com read (file path) usando encoding
-                    cfg = configparser.ConfigParser(allow_no_value=True)
-                    try:
-                        # read aceita encoding desde Python 3.2
-                        cfg.read(path, encoding=enc)
-                        self.cfg = cfg
-                        self.file_encoding = enc
-                        break
-                    except Exception as e:
-                        last_exception = e
-                        continue
-                except Exception as e:
-                    last_exception = e
-                    continue
-            except Exception as e:
-                last_exception = e
-                continue
-
-        if not self.file_encoding:
-            # última tentativa: leitura permissiva com latin-1 (mapeia bytes 1:1)
-            try:
-                with open(path, 'r', encoding='latin-1', errors='replace') as fh:
-                    text = fh.read()
-                cfg = configparser.ConfigParser(allow_no_value=True)
-                try:
-                    cfg.read_string(text)
-                    self.cfg = cfg
-                except Exception:
-                    cfg.read(path, encoding='latin-1')
-                    self.cfg = cfg
-                self.file_encoding = 'latin-1'
-            except Exception as e:
-                messagebox.showerror('Erro', f'Erro ao abrir {path}: {e}\n{last_exception}')
+                self.cfg.read(path, encoding=enc)
+            except Exception as e2:
+                messagebox.showerror('Erro', f'Erro ao parsear INI: {e}\n{e2}')
+                self.show_raw_text(text)
                 return
 
-        self.refresh_ui()
-        self.title(f'INI Editor — {os.path.relpath(path, SCRIPT_DIR)}')
+        # preencher UI de INI
+        self.populate_ini_ui()
+        self.title(f'INI Editor — {path.name}')
 
-    def refresh_ui(self):
-        # sections
-        self.section_list.delete(0, 'end')
+    def show_raw_text(self, text: str):
+        # mostrar raw dentro do viewer central (não abrir Toplevel)
+        for c in list(self.viewer_frame.winfo_children()):
+            c.destroy()
+        lbl = ttk.Label(self.viewer_frame, text='Visualizador bruto')
+        lbl.pack(anchor='w')
+        txt = tk.Text(self.viewer_frame, wrap='none')
+        txt.pack(fill='both', expand=True)
+        txt.insert('1.0', text)
+
+    def populate_ini_ui(self):
+        # garantir widgets do editor INI
+        self.ensure_ini_widgets()
+        # preencher seções
+        self.sections_lb.delete(0, 'end')
         for s in self.cfg.sections():
-            self.section_list.insert('end', s)
-        # limpa tabela de chaves
-        try:
-            for iid in self.key_tree.get_children():
-                self.key_tree.delete(iid)
-        except Exception:
-            pass
+            self.sections_lb.insert('end', s)
+        # limpar keys
+        for iid in self.keys_tree.get_children():
+            self.keys_tree.delete(iid)
         self.value_text.delete('1.0', 'end')
 
     def on_section_select(self, event=None):
-        sel = self.section_list.curselection()
-        # limpa tabela
-        try:
-            for iid in self.key_tree.get_children():
-                self.key_tree.delete(iid)
-        except Exception:
-            pass
+        sel = self.sections_lb.curselection()
+        for iid in self.keys_tree.get_children():
+            self.keys_tree.delete(iid)
         self.value_text.delete('1.0', 'end')
         if not sel:
             return
-        sec = self.section_list.get(sel[0])
+        sec = self.sections_lb.get(sel[0])
         for k in self.cfg[sec]:
-            val = self.cfg.get(sec, k, fallback='')
-            # preview: primeira linha ou truncado
-            preview = val.splitlines()[0] if val else ''
+            v = self.cfg.get(sec, k, fallback='')
+            preview = v.splitlines()[0] if v else ''
             if len(preview) > 200:
                 preview = preview[:197] + '...'
-            self.key_tree.insert('', 'end', values=(k, preview))
+            self.keys_tree.insert('', 'end', values=(k, preview))
 
     def on_key_select(self, event=None):
-        sel = self.key_tree.selection()
-        ssel = self.section_list.curselection()
+        sel = self.keys_tree.selection()
+        ssel = self.sections_lb.curselection()
         self.value_text.delete('1.0', 'end')
         if not sel or not ssel:
             return
-        sec = self.section_list.get(ssel[0])
+        sec = self.sections_lb.get(ssel[0])
         item = sel[0]
-        vals = self.key_tree.item(item, 'values')
+        vals = self.keys_tree.item(item, 'values')
         if not vals:
             return
         key = vals[0]
         val = self.cfg.get(sec, key, fallback='')
         self.value_text.insert('1.0', val)
+
+    def on_key_double_click(self, event=None):
+        # editar value in-place: abre drawer similar ao item_table_view
+        sel = self.keys_tree.selection()
+        ssel = self.sections_lb.curselection()
+        if not sel or not ssel:
+            return
+        sec = self.sections_lb.get(ssel[0])
+        item = sel[0]
+        key = self.keys_tree.item(item, 'values')[0]
+        cur = self.cfg.get(sec, key, fallback='')
+        dlg = tk.Toplevel(self)
+        dlg.title(f'Editar {key}')
+        dlg.geometry('600x400')
+        txt = tk.Text(dlg, wrap='word')
+        txt.pack(fill='both', expand=True)
+        txt.insert('1.0', cur)
+
+        def do_ok():
+            new = txt.get('1.0', 'end').rstrip('\n')
+            self.cfg.set(sec, key, new)
+            # atualizar preview
+            preview = new.splitlines()[0] if new else ''
+            if len(preview) > 200:
+                preview = preview[:197] + '...'
+            self.keys_tree.item(item, values=(key, preview))
+            dlg.destroy()
+
+        def do_cancel():
+            dlg.destroy()
+
+        fb = ttk.Frame(dlg)
+        fb.pack(fill='x')
+        ttk.Button(fb, text='OK', command=do_ok).pack(side='left')
+        ttk.Button(fb, text='Cancelar', command=do_cancel).pack(side='left', padx=6)
 
     def add_section(self):
         name = simple_input(self, 'Nova Seção', 'Nome da seção:')
@@ -297,81 +347,90 @@ class IniEditor(tk.Tk):
             return
         if not self.cfg.has_section(name):
             self.cfg.add_section(name)
-            self.refresh_ui()
-            # select new
-            idx = self.section_list.get(0, 'end').index(name)
-            self.section_list.select_set(idx)
+            self.populate_ini_ui()
+            idx = list(self.cfg.sections()).index(name)
+            self.sections_lb.select_set(idx)
         else:
             messagebox.showinfo('Info', 'Seção já existe')
 
     def remove_section(self):
-        sel = self.section_list.curselection()
+        sel = self.sections_lb.curselection()
         if not sel:
             return
-        sec = self.section_list.get(sel[0])
+        sec = self.sections_lb.get(sel[0])
         if messagebox.askyesno('Confirmar', f'Remover seção "{sec}"?'):
             self.cfg.remove_section(sec)
-            self.refresh_ui()
+            self.populate_ini_ui()
 
     def add_key(self):
-        ssel = self.section_list.curselection()
+        ssel = self.sections_lb.curselection()
         if not ssel:
             messagebox.showinfo('Info', 'Selecione uma seção primeiro')
             return
-        sec = self.section_list.get(ssel[0])
+        sec = self.sections_lb.get(ssel[0])
         key = simple_input(self, 'Nova Chave', 'Nome da chave:')
         if not key:
             return
         val = simple_input(self, 'Valor', 'Valor inicial (opcional):') or ''
         self.cfg.set(sec, key, val)
-        # atualiza tabela
         self.on_section_select()
-        # selecionar nova chave na tabela
-        for iid in self.key_tree.get_children():
-            if self.key_tree.item(iid, 'values')[0] == key:
-                self.key_tree.selection_set(iid)
-                self.key_tree.see(iid)
-                break
 
     def remove_key(self):
-        ksel = self.key_tree.selection()
-        ssel = self.section_list.curselection()
+        ksel = self.keys_tree.selection()
+        ssel = self.sections_lb.curselection()
         if not ksel or not ssel:
             return
-        sec = self.section_list.get(ssel[0])
+        sec = self.sections_lb.get(ssel[0])
         item = ksel[0]
-        key = self.key_tree.item(item, 'values')[0]
+        key = self.keys_tree.item(item, 'values')[0]
         if messagebox.askyesno('Confirmar', f'Remover chave "{key}"?'):
             self.cfg.remove_option(sec, key)
             self.on_section_select()
 
-    def save_file(self):
-        if not self.config_file:
+    def save_current(self):
+        if not self.current_file:
             messagebox.showinfo('Info', 'Nenhum arquivo aberto')
             return
-        # if a key is selected, store current text
-        ksel = self.key_tree.selection()
-        ssel = self.section_list.curselection()
-        if ksel and ssel:
-            sec = self.section_list.get(ssel[0])
-            item = ksel[0]
-            key = self.key_tree.item(item, 'values')[0]
-            val = self.value_text.get('1.0', 'end').rstrip('\n')
-            self.cfg.set(sec, key, val)
+        # se há seleção de key (modo INI), atualiza a cfg com o valor do editor
+        if hasattr(self, 'keys_tree') and hasattr(self, 'sections_lb'):
+            try:
+                ksel = self.keys_tree.selection()
+                ssel = self.sections_lb.curselection()
+                if ksel and ssel:
+                    sec = self.sections_lb.get(ssel[0])
+                    item = ksel[0]
+                    key = self.keys_tree.item(item, 'values')[0]
+                    val = self.value_text.get('1.0', 'end').rstrip('\n')
+                    self.cfg.set(sec, key, val)
+            except Exception:
+                # se não houver widgets (modo table), ignora
+                pass
 
+        enc = self.current_encoding or 'utf-8'
+        # salvar com encoding detectado
         try:
-            enc = self.file_encoding or 'utf-8'
-            # escreve usando a codificação detectada (ou utf-8 por padrão)
-            with open(self.config_file, 'w', encoding=enc, errors='replace') as fh:
+            # gravar atomically: escrever em temporário e renomear
+            tmp = self.current_file.with_suffix(self.current_file.suffix + '.tmp')
+            with tmp.open('w', encoding=enc, errors='replace', newline='') as fh:
                 self.cfg.write(fh)
-            messagebox.showinfo('Salvo', f'Arquivo salvo: {os.path.relpath(self.config_file, SCRIPT_DIR)} (codificação: {enc})')
+            # backup
+            bak = self.current_file.with_name(self.current_file.name + '.bak')
+            try:
+                if self.current_file.exists():
+                    self.current_file.replace(bak)
+            except Exception:
+                import shutil
+                shutil.copy2(str(self.current_file), str(bak))
+            # move tmp to original
+            tmp.replace(self.current_file)
+            messagebox.showinfo('Salvo', f'Arquivo salvo: {self.current_file} (backup: {bak.name})')
         except Exception as e:
             messagebox.showerror('Erro', f'Erro ao salvar: {e}')
 
-    def reload_current_file(self):
-        if not self.config_file:
+    def reload_current(self):
+        if not self.current_file:
             return
-        self.open_file(self.config_file)
+        self.open_file(self.current_file)
 
 
 def simple_input(root, title, prompt):
@@ -384,10 +443,10 @@ def simple_input(root, title, prompt):
     ent.pack(padx=10, pady=(0,10))
     ent.focus()
 
-    result = {'value': None}
+    res = {'value': None}
 
     def ok():
-        result['value'] = ent.get().strip()
+        res['value'] = ent.get().strip()
         dlg.destroy()
 
     def cancel():
@@ -399,8 +458,9 @@ def simple_input(root, title, prompt):
     ttk.Button(btns, text='Cancelar', command=cancel).pack(side='left', padx=6)
 
     root.wait_window(dlg)
-    return result['value']
+    return res['value']
+
 
 if __name__ == '__main__':
-    app = IniEditor()
+    app = IniEditorApp()
     app.mainloop()
