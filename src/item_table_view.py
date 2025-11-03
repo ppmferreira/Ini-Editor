@@ -192,6 +192,99 @@ def show_item_table(parent, title: str, headers: List[str], records: List[Dict[s
         tk.messagebox.showinfo('Exportado', f'Exportado: {fpath}')
 
     ttk.Button(btn_frame, text='Exportar CSV', command=export_csv).pack(side='left')
+    # botão para adicionar linha
+    def add_row():
+        # criar registro vazio de acordo com headers
+        rec = {h: '' for h in headers}
+        records.append(rec)
+        vals = [rec.get(h, '') for h in headers]
+        idx = len(records) - 1
+        tag = 'even' if (idx % 2 == 0) else 'odd'
+        tree.insert('', 'end', values=vals, tags=(tag,))
+
+    def edit_headers():
+        dlg = tk.Toplevel(win if not embed else parent.winfo_toplevel())
+        dlg.title('Editar cabeçalhos')
+        frm = ttk.Frame(dlg)
+        frm.pack(fill='both', expand=True, padx=8, pady=8)
+        entries = []
+        for i, h in enumerate(headers):
+            row = ttk.Frame(frm)
+            row.pack(fill='x', pady=2)
+            ttk.Label(row, text=f'{i:02d}').pack(side='left')
+            ent = ttk.Entry(row, width=60)
+            ent.pack(side='left', padx=6)
+            ent.insert(0, h)
+            entries.append(ent)
+
+        def do_ok():
+            # obter novos nomes e remapear registros por índice
+            new_headers = [e.get().strip() or f'Unknown {i}' for i, e in enumerate(entries)]
+            # remapear cada record: manter valores por índice
+            new_records = []
+            for rec in records:
+                new_rec = {}
+                # rec pode conter old header names; mapear por posição
+                old_vals = [rec.get(h, '') for h in headers]
+                for i, nh in enumerate(new_headers):
+                    new_rec[nh] = old_vals[i] if i < len(old_vals) else ''
+                new_records.append(new_rec)
+            # atualizar headers e records (in-place)
+            headers.clear()
+            headers.extend(new_headers)
+            records.clear()
+            records.extend(new_records)
+            # atualizar treeview colunas
+            tree.config(columns=headers)
+            for c in headers:
+                tree.heading(c, text=c, anchor='center')
+                tree.column(c, width=120 if c.lower() not in ('name','tip') else 300, anchor='center')
+            # atualizar linhas
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for i, rec in enumerate(records):
+                vals = [rec.get(h, '') for h in headers]
+                tag = 'even' if (i % 2 == 0) else 'odd'
+                tree.insert('', 'end', values=vals, tags=(tag,))
+            dlg.destroy()
+
+        def do_cancel():
+            dlg.destroy()
+
+        fb = ttk.Frame(dlg)
+        fb.pack(pady=6)
+        ttk.Button(fb, text='OK', command=do_ok).pack(side='left')
+        ttk.Button(fb, text='Cancelar', command=do_cancel).pack(side='left', padx=6)
+
+    ttk.Button(btn_frame, text='Adicionar linha', command=add_row).pack(side='left', padx=6)
+    ttk.Button(btn_frame, text='Editar cabeçalhos', command=edit_headers).pack(side='left', padx=6)
+
+    def save_header_file():
+        if not file_path:
+            tk.messagebox.showinfo('Salvar header', 'Nenhum arquivo associado para derivar o nome do header.')
+            return
+        # headers folder: assume Assets/Headers relative to file_path (file_path is in Assets/Client/...)
+        headers_dir = file_path.parent.parent / 'Headers'
+        try:
+            headers_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            tk.messagebox.showerror('Erro', f'Não foi possível criar pasta de headers: {e}')
+            return
+        # padrão de nome desejado: H_<original_filename_stem>.ini, ex: C_Item.ini -> H_C_Item.ini
+        fname = f"H_{file_path.stem}.ini"
+        fpath = headers_dir / fname
+        if fpath.exists():
+            if not tk.messagebox.askyesno('Confirmar', f'O header {fpath.name} já existe. Sobrescrever?'):
+                return
+        try:
+            # escrever cabeçalhos como CSV (uma linha)
+            with fpath.open('w', encoding='utf-8', newline='') as fh:
+                fh.write(','.join(headers))
+            tk.messagebox.showinfo('Header salvo', f'Header salvo: {fpath}')
+        except Exception as e:
+            tk.messagebox.showerror('Erro', f'Erro ao salvar header: {e}')
+
+    ttk.Button(btn_frame, text='Salvar header', command=save_header_file).pack(side='left', padx=6)
 
     # salvar de volta para o arquivo pipe (se file_path fornecido)
     def save_back():

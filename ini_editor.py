@@ -211,20 +211,150 @@ class IniEditorApp(tk.Tk):
             messagebox.showerror('Erro ao abrir', f'Erro ao ler {path}: {e}')
             return
 
-        # primeiro tente detectar arquivos pipe-delimited (items) usando headers h_item
+        # primeiro tente detectar arquivos pipe-delimited (items) usando headers correspondentes
         try:
-            if data_parser and H_ITEM.exists():
-                headers = data_parser.load_headers(H_ITEM)
-                # usar heurística mais robusta (não confiar no tamanho do dict,
-                # pois headers podem ter nomes duplicados que colapsam chaves)
-                if data_parser.is_pipe_file(text, headers):
-                    records = data_parser.parse_pipe_text(text, headers)
+            if data_parser:
+                # construir candidatos de header com base no nome do arquivo
+                stem = path.stem.lower()  # ex: 'c_item' ou 'c_itemmall'
+                candidates = []
+                if stem.startswith('c_'):
+                    candidates.append('h_' + stem[2:])
+                if stem.startswith('c') and not stem.startswith('c_'):
+                    candidates.append('h' + stem[1:])
+                candidates.append('h_' + stem)
+                # não adicionar fallback genérico (usar apenas header com mesmo nome);
+                # se nenhum header existir, geraremos Unknown headers abaixo
+
+                # detectar linha de metadados no início do arquivo (ex: "|V.16|93|")
+                import re
+                meta_re = re.compile(r'^[\|\s]*V\.\d+\|(\d+)\|')
+                expected_fields_from_meta = None
+                # procurar na primeira 5 linhas
+                for ln in text.splitlines()[:5]:
+                    m = meta_re.match(ln.strip())
+                    if m:
+                        try:
+                            expected_fields_from_meta = int(m.group(1))
+                        except Exception:
+                            expected_fields_from_meta = None
+                        break
+
+                # procurar header cujo nome corresponda a um dos padrões desejados
+                chosen_headers = None
+                chosen_path = None
+                # construir nomes-alvo (sem considerar extensão), case-insensitive
+                stem_orig = path.stem  # e.g. 'C_Item'
+                stem_low = stem_orig.lower()
+                if stem_low.startswith('c_'):
+                    stripped = stem_low[2:]
+                elif stem_low.startswith('c'):
+                    stripped = stem_low[1:]
+                else:
+                    stripped = stem_low
+
+                target_names = set([
+                    f"h_{stem_low}",      # h_c_item or similar
+                    f"h_{stripped}",      # h_item
+                    f"h{stripped}",       # hitem
+                    f"h{stem_low}",       # hc_item
+                    f"h_{stem_orig.lower()}",
+                    f"h_{stem_orig}",
+                    f"h_{path.name.lower()}",
+                    f"h_{path.name}",
+                    f"h_{path.stem}",
+                    f"h_{path.stem.lower()}",
+                    f"h_{stripped}",
+                    f"h_{stripped}.ini",
+                    f"h_{stem_low}.ini",
+                    f"h_{stem_orig}.ini",
+                    f"h_{path.stem}.ini",
+                    f"h_{path.name}.ini",
+                    f"h_{path.name.lower()}.ini",
+                    f"H_{path.stem}",     # H_C_Item
+                    f"H_{path.stem}.ini",
+                ])
+
+                # procurar arquivos no diretório Headers que batam com os nomes-alvo (case-insensitive)
+                if HEADERS_DIR.exists():
+                    # priorizar nome padronizado 'H_<stem>' (case-insensitive)
+                    prioritized = []
+                    prioritized.extend([f'H_{path.stem}', f'h_{path.stem.lower()}'])
+                    # depois procurar outros candidatos encontrados anteriormente
+                    prioritized.extend(list(target_names))
+                    seen = set()
+                    for hf in HEADERS_DIR.iterdir():
+                        if not hf.is_file():
+                            continue
+                        name_no_ext = hf.stem
+                        lname = name_no_ext.lower()
+                        if lname in {s.lower() for s in prioritized} and lname not in seen:
+                            seen.add(lname)
+                            try:
+                                hdrs = data_parser.load_headers(hf)
+                            except Exception:
+                                continue
+                            # se temos metadado, validar/ajustar tamanho do header
+                            if expected_fields_from_meta is not None:
+                                if len(hdrs) != expected_fields_from_meta:
+                                    # ajustar hdrs: truncar ou preencher com Unknown
+                                    if len(hdrs) > expected_fields_from_meta:
+                                        hdrs = hdrs[:expected_fields_from_meta]
+                                    else:
+                                        hdrs = hdrs + [f'Unknown {i}' for i in range(len(hdrs), expected_fields_from_meta)]
+                            if data_parser.is_pipe_file(text, hdrs):
+                                chosen_headers = hdrs
+                                chosen_path = hf
+                                break
+
+                # se encontramos headers compatíveis, parse e mostrar
+                if chosen_headers is not None:
+                    records = data_parser.parse_pipe_text(text, chosen_headers)
                     if item_table_view:
-                        # limpar placeholder
                         for c in list(self.viewer_frame.winfo_children()):
                             c.destroy()
-                        # embedar a tabela no painel central
-                        item_table_view.show_item_table(self.viewer_frame, path.name, headers, records, encoding=enc, file_path=path, embed=True)
+                        item_table_view.show_item_table(self.viewer_frame, path.name, chosen_headers, records, encoding=enc, file_path=path, embed=True)
+                        self.title(f'INI Editor — {path.name} (encoding: {enc})')
+                        return
+
+                # se não encontramos nenhum header existente, tentar deduzir número de campos
+                # se não encontramos nenhum header existente, primeiro procurar linha de metadados
+                # do tipo |V.<vers>|<ncols>| ou V.<vers>|<ncols>| e usar <ncols> como número de colunas
+                import re
+                meta_re = re.compile(r'^[\|\s]*V\.\d+\|(\d+)\|')
+                lines = text.splitlines()
+                ncols = None
+                for ln in lines:
+                    s = ln.strip()
+                    if not s:
+                        continue
+                    m = meta_re.match(s)
+                    if m:
+                        try:
+                            ncols = int(m.group(1))
+                        except Exception:
+                            ncols = None
+                    break
+
+                if ncols is None:
+                    # fallback: procurar a linha com maior número de pipes e usar isso
+                    max_pipes = 0
+                    for ln in lines:
+                        pc = ln.count('|')
+                        if pc > max_pipes:
+                            max_pipes = pc
+                    if max_pipes >= 2:
+                        ncols = max_pipes + 1
+
+                if ncols and ncols >= 1:
+                    expected_fields = ncols
+                    # criar headers Unknown 0..N-1
+                    gen_headers = [f'Unknown {i}' for i in range(expected_fields)]
+                    records = data_parser.parse_pipe_text(text, gen_headers)
+                    if item_table_view:
+                        for c in list(self.viewer_frame.winfo_children()):
+                            c.destroy()
+                        # passa gen_headers — usuário poderá renomear via UI
+                        item_table_view.show_item_table(self.viewer_frame, path.name, gen_headers, records, encoding=enc, file_path=path, embed=True)
                         self.title(f'INI Editor — {path.name} (encoding: {enc})')
                         return
         except Exception:

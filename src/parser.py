@@ -166,6 +166,7 @@ def parse_pipe_text(text: str, headers: List[str]) -> List[dict]:
 
     records = []
     buf_lines = []
+    last_rec = None
 
     # pular metadados iniciais como "V.16|93|" se existirem
     import re
@@ -183,7 +184,15 @@ def parse_pipe_text(text: str, headers: List[str]) -> List[dict]:
             if not newrec_re.match(raw_line) and raw_line.count('|') < expected_separators:
                 if last_rec is not None:
                     prev = last_rec.get('Tip', '') or ''
-                    last_rec['Tip'] = prev + raw_line.rstrip('\n')
+                    cleaned = raw_line.rstrip('\n')
+                    if cleaned.startswith('|'):
+                        cleaned = cleaned[1:]
+                    if cleaned.endswith('|'):
+                        cleaned = cleaned[:-1]
+                    if prev:
+                        last_rec['Tip'] = prev + '\n' + cleaned
+                    else:
+                        last_rec['Tip'] = cleaned
                 else:
                     pass
                 continue
@@ -199,7 +208,12 @@ def parse_pipe_text(text: str, headers: List[str]) -> List[dict]:
             key = headers[i]
             val = parts[i]
             if key.lower() == 'tip':
-                rec[key] = val.rstrip('\n')
+                cleaned = val.rstrip('\n')
+                if cleaned.startswith('|'):
+                    cleaned = cleaned[1:]
+                if cleaned.endswith('|'):
+                    cleaned = cleaned[:-1]
+                rec[key] = cleaned
             else:
                 rec[key] = val.strip()
         records.append(rec)
@@ -211,7 +225,19 @@ def parse_pipe_text(text: str, headers: List[str]) -> List[dict]:
         parts = buf.rstrip('\n').split('|', expected_separators)
         if len(parts) < expected_fields:
             parts += [''] * (expected_fields - len(parts))
-        rec = {headers[i]: parts[i].strip() for i in range(expected_fields)}
+        rec = {}
+        for i in range(expected_fields):
+            key = headers[i]
+            val = parts[i]
+            if key.lower() == 'tip':
+                cleaned = val.rstrip('\n')
+                if cleaned.startswith('|'):
+                    cleaned = cleaned[1:]
+                if cleaned.endswith('|'):
+                    cleaned = cleaned[:-1]
+                rec[key] = cleaned
+            else:
+                rec[key] = val.strip()
         records.append(rec)
 
     return records
